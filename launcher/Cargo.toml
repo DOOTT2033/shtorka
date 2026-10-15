@@ -1,0 +1,20 @@
+[package]
+name = "launcher"
+version = "0.0.1-alpha"
+edition = "2021"
+build = "build.rs"
+
+[[bin]]
+name = "messenger-server"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+if-addrs = "0.13"
+ureq = "2"
+server = { path = "../server" }
