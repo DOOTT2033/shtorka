@@ -28,3 +28,24 @@ messenger/
 3. Лаунчер сервера: запуск/остановка, показ адресов.
 4. Сборка exe и apk, проверка через Radmin VPN.
 5. Позже: публичный доступ, шифрование, история на диске.
+
+## Сервер (сейчас)
+
+Запуск (нужен Rust):
+
+```
+cargo run -p server --bin server -- --port 7878
+```
+
+Эндпоинты:
+- `GET /ws?name=ИМЯ` — WebSocket чата. Сообщения в JSON (`shared/src/lib.rs`).
+- `GET /history` — последние 500 сообщений.
+- `GET /health` — проверка, что сервер жив.
+
+Тестовый консольный клиент:
+
+```
+cargo run -p server --bin testclient -- --name Вася --url ws://127.0.0.1:7878
+```
+
+Автотест: `bash scripts/smoke.sh`.

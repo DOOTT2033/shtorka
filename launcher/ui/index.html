@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Сервер мессенджера</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">✉</span> Сервер мессенджера</div>
+  <div id="state" class="pill off"><span class="dot"></span><span id="state-text">Остановлен</span></div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Управление</h2>
+    <label class="field">
+      <span>Порт</span>
+      <input id="port" type="number" min="1024" max="65535" value="7878">
+    </label>
+    <div class="row">
+      <button id="toggle" class="primary">Запустить</button>
+    </div>
+    <p class="hint" id="message"></p>
+  </section>
+
+  <section class="card">
+    <div class="row between">
+      <h2>Адреса для подключения</h2>
+      <button id="pubBtn" class="ghost small">Узнать внешний IP</button>
+    </div>
+    <p class="hint">Скопируйте адрес и вставьте его в клиент. Radmin VPN работает, пока оба устройства в одной сети Radmin.</p>
+    <ul id="addresses" class="addresses"></ul>
+    <div id="public" class="public hidden"></div>
+  </section>
+
+  <section class="card">
+    <h2>Онлайн <span id="count" class="count">0</span></h2>
+    <ul id="users" class="users"><li class="empty">Никого нет</li></ul>
+    <p class="hint">Сообщений за сессию: <b id="msgs">0</b></p>
+  </section>
+
+  <section class="card wide">
+    <h2>Журнал</h2>
+    <pre id="logs" class="logs"></pre>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

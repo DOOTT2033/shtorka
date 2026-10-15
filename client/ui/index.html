@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Messenger</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="login" class="screen">
+  <div class="login-card">
+    <div class="logo big">✉</div>
+    <h1>Messenger</h1>
+    <label class="field">
+      <span>Адрес сервера</span>
+      <input id="server" placeholder="192.168.1.5:7878" autocomplete="off">
+    </label>
+    <label class="field">
+      <span>Ваше имя</span>
+      <input id="name" placeholder="Например, Вася" maxlength="32" autocomplete="off">
+    </label>
+    <button id="connect" class="primary wide">Войти в чат</button>
+    <p id="login-error" class="error"></p>
+    <p class="hint">Адрес можно взять в лаунчере сервера. Для Radmin VPN — адрес 26.x.x.x.</p>
+  </div>
+</div>
+
+<div id="chat" class="screen hidden">
+  <header>
+    <div class="head-main">
+      <div class="logo">✉</div>
+      <div>
+        <div class="title" id="title">Общий чат</div>
+        <div class="sub" id="sub">—</div>
+      </div>
+    </div>
+    <div class="head-actions">
+      <span id="status" class="status">● офлайн</span>
+      <button id="logout" class="ghost small">Выйти</button>
+    </div>
+  </header>
+  <div id="messages" class="messages"></div>
+  <form id="form" class="composer">
+    <textarea id="input" rows="1" placeholder="Написать сообщение…" maxlength="4000"></textarea>
+    <button id="send" class="primary" type="submit">Отправить</button>
+  </form>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
