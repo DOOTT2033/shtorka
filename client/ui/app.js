@@ -1,12 +1,15 @@
-// Шторка — клиент. Подключение, сообщения, файлы, записи, темы.
+// Шторка — клиент 0.0.2. Аккаунты, настройки, уведомления, сообщения, файлы, записи, темы.
 const $ = (id) => document.getElementById(id);
 const LS = "shtorka.client";
 const THEME_KEY = "shtorka.theme";
+const NOTIF_KEY = "shtorka.notif";
 const MAX_UPLOAD = 50 * 1024 * 1024;
 const THEME_NAMES = { dark: "Тёмная", light: "Светлая", auto: "Авто" };
 
 let ws = null;
 let me = "";
+let token = "";
+let authMode = "login"; // login | register
 let serverUrl = "";
 let httpUrl = "";
 let seen = new Set();
@@ -265,12 +268,43 @@ function setStatus(ok, text) {
 
 async function loadHistory() {
   try {
-    const r = await fetch(httpUrl + "/history");
+    const r = await fetch(`${httpUrl}/history?token=${encodeURIComponent(token)}`);
+    if (!r.ok) throw new Error(String(r.status));
     const list = await r.json();
     for (const m of list) addMessage(m);
   } catch {
     addSystem("Не удалось загрузить историю", "errline");
   }
+}
+
+/* ---------- Уведомления ---------- */
+
+function notifsEnabled() {
+  return localStorage.getItem(NOTIF_KEY) === "1";
+}
+
+async function enableNotifs() {
+  if (!("Notification" in window)) {
+    toast("Уведомления не поддерживаются", true);
+    return false;
+  }
+  if (Notification.permission === "granted") return true;
+  if (Notification.permission === "denied") {
+    toast("Уведомления запрещены в настройках системы", true);
+    return false;
+  }
+  return (await Notification.requestPermission()) === "granted";
+}
+
+function notifyNew(m) {
+  if (!notifsEnabled() || !("Notification" in window) || Notification.permission !== "granted") return;
+  if (!document.hidden && document.hasFocus()) return;
+  if (m.from === me) return;
+  const preview = m.attachment ? `[${kindTitle(m.attachment.kind)}] ${m.text}`.trim() : m.text;
+  try {
+    const n = new Notification(m.from, { body: preview || "Новое сообщение", tag: "shtorka-" + m.id });
+    n.onclick = () => window.focus();
+  } catch (e) { /* вебвью может не дать — не страшно */ }
 }
 
 /* ---------- Соединение ---------- */
@@ -283,7 +317,7 @@ function connect() {
   }
   manualClose = false;
   setStatus(false, "подключение…");
-  const sock = new WebSocket(`${serverUrl}/ws?name=${encodeURIComponent(me)}`);
+  const sock = new WebSocket(`${serverUrl}/ws?name=${encodeURIComponent(me)}&token=${encodeURIComponent(token)}`);
   ws = sock;
 
   sock.onmessage = (ev) => {
@@ -300,16 +334,23 @@ function connect() {
         break;
       case "text":
         addMessage(m);
+        notifyNew(m);
         break;
       case "system":
         addSystem(m.text);
         break;
+      case "kick":
+        manualClose = true;
+        sock.close();
+        logout(m.text);
+        toast(m.text, true);
+        break;
       case "error":
         addSystem(m.text, "errline");
-        if (m.text.includes("занято") || m.text.includes("Некорректное")) {
+        if (m.text.includes("авториз")) {
           manualClose = true;
           sock.close();
-          logout(m.text);
+          logout("Сессия устарела. Войдите заново.");
         }
         break;
     }
@@ -342,13 +383,70 @@ function logout(errText = "") {
   seen = new Set();
   lastDay = "";
   lastFrom = "";
+  token = "";
   $("list").innerHTML = "";
   $("ci-last").textContent = "Пока пусто";
   $("ci-time").textContent = "";
   $("app").classList.add("hidden");
+  $("settings").classList.add("hidden");
   $("login").classList.remove("hidden");
+  $("password").value = "";
   $("login-error").textContent = errText;
   setStatus(false, "офлайн");
+  const saved = JSON.parse(localStorage.getItem(LS) || "null");
+  if (saved) localStorage.setItem(LS, JSON.stringify({ server: saved.server || "", name: saved.name || "" }));
+}
+
+/* ---------- Настройки ---------- */
+
+function openSettings() {
+  $("set-name").textContent = me;
+  $("set-server").textContent = serverUrl.replace(/^wss?:\/\//, "");
+  $("pw-old").value = "";
+  $("pw-new").value = "";
+  $("pw-msg").textContent = "";
+  $("pw-msg").classList.remove("err");
+  $("notif-toggle").checked = notifsEnabled() && "Notification" in window && Notification.permission === "granted";
+  $("settings").classList.remove("hidden");
+}
+
+function closeSettings() {
+  $("settings").classList.add("hidden");
+}
+
+async function changePassword() {
+  const oldPw = $("pw-old").value;
+  const newPw = $("pw-new").value;
+  const msg = $("pw-msg");
+  msg.classList.remove("err");
+  if (!oldPw || !newPw) {
+    msg.textContent = "Заполните оба поля";
+    msg.classList.add("err");
+    return;
+  }
+  try {
+    const r = await fetch(`${httpUrl}/password`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token, old: oldPw, new: newPw }),
+    });
+    const text = await r.text();
+    if (!r.ok) {
+      msg.textContent = text || "Ошибка " + r.status;
+      msg.classList.add("err");
+      return;
+    }
+    msg.textContent = "Пароль изменён";
+    $("pw-old").value = "";
+    $("pw-new").value = "";
+  } catch {
+    msg.textContent = "Сервер не отвечает";
+    msg.classList.add("err");
+  }
+}
+
+function saveSession() {
+  localStorage.setItem(LS, JSON.stringify({ server: $("server").value.trim(), name: me, token }));
 }
 
 async function enter() {
@@ -361,14 +459,42 @@ async function enter() {
     return;
   }
   const name = $("name").value.trim();
+  const password = $("password").value;
   if (!name) {
     $("login-error").textContent = "Введите имя";
     return;
   }
-  serverUrl = url;
-  httpUrl = url.replace(/^ws/, "http");
-  me = name;
-  localStorage.setItem(LS, JSON.stringify({ server: $("server").value.trim(), name }));
+  if (!password) {
+    $("login-error").textContent = "Введите пароль";
+    return;
+  }
+
+  const http = url.replace(/^ws/, "http");
+  $("connect").disabled = true;
+  try {
+    const r = await fetch(`${http}/${authMode}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name, password }),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      $("login-error").textContent = text || "Ошибка " + r.status;
+      return;
+    }
+    const auth = await r.json();
+    serverUrl = url;
+    httpUrl = http;
+    me = auth.name;
+    token = auth.token;
+    saveSession();
+  } catch (e) {
+    $("login-error").textContent = "Сервер не отвечает";
+    return;
+  } finally {
+    $("connect").disabled = false;
+  }
+
   seen = new Set();
   lastDay = "";
   lastFrom = "";
@@ -410,7 +536,7 @@ async function upload(blob, name, mime) {
   if (blob.size > MAX_UPLOAD) throw new Error("Файл больше 50 МБ");
   setBusy(true);
   try {
-    const url = `${httpUrl}/upload?name=${encodeURIComponent(name)}&mime=${encodeURIComponent(baseMime(mime))}`;
+    const url = `${httpUrl}/upload?token=${encodeURIComponent(token)}&name=${encodeURIComponent(name)}&mime=${encodeURIComponent(baseMime(mime))}`;
     const r = await fetch(url, { method: "POST", body: blob });
     if (!r.ok) throw new Error(await r.text());
     return await r.json();
@@ -540,10 +666,39 @@ function toggleRecording(kind) {
 
 $("connect").onclick = enter;
 $("name").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("password").focus();
+});
+$("password").addEventListener("keydown", (e) => {
   if (e.key === "Enter") enter();
 });
 $("server").addEventListener("keydown", (e) => {
   if (e.key === "Enter") $("name").focus();
+});
+$("mode-toggle").onclick = () => {
+  authMode = authMode === "login" ? "register" : "login";
+  $("connect").textContent = authMode === "login" ? "Войти" : "Зарегистрироваться";
+  $("mode-toggle").innerHTML =
+    authMode === "login"
+      ? 'Нет аккаунта? <b>Зарегистрироваться</b>'
+      : 'Уже есть аккаунт? <b>Войти</b>';
+  $("login-error").textContent = "";
+};
+$("settings-btn").onclick = openSettings;
+$("settings-close").onclick = closeSettings;
+$("settings").addEventListener("click", (e) => {
+  if (e.target === $("settings")) closeSettings();
+});
+$("pw-save").onclick = changePassword;
+$("settings-logout").onclick = () => logout();
+$("notif-toggle").addEventListener("change", async (e) => {
+  if (e.target.checked) {
+    const ok = await enableNotifs();
+    e.target.checked = ok;
+    localStorage.setItem(NOTIF_KEY, ok ? "1" : "0");
+    if (ok) toast("Уведомления включены");
+  } else {
+    localStorage.setItem(NOTIF_KEY, "0");
+  }
 });
 $("form").addEventListener("submit", (e) => {
   e.preventDefault();
@@ -591,11 +746,33 @@ $("input").addEventListener("paste", (e) => {
 });
 
 applyTheme(currentMode());
-try {
-  const saved = JSON.parse(localStorage.getItem(LS) || "null");
+(async () => {
+  let saved = null;
+  try {
+    saved = JSON.parse(localStorage.getItem(LS) || "null");
+  } catch (e) {}
   if (saved) {
     $("server").value = saved.server || "";
     $("name").value = saved.name || "";
+    // Автовход по сохранённой сессии: проверяем токен через /account.
+    if (saved.token && saved.server && saved.name) {
+      try {
+        const http = normalizeServer(saved.server).replace(/^ws/, "http");
+        const r = await fetch(`${http}/account?token=${encodeURIComponent(saved.token)}`);
+        if (r.ok) {
+          const info = await r.json();
+          serverUrl = normalizeServer(saved.server);
+          httpUrl = http;
+          me = info.name;
+          token = saved.token;
+          showApp();
+          await loadHistory();
+          connect();
+          return;
+        }
+      } catch (e) { /* сервер недоступен — покажем форму входа */ }
+    }
   }
-} catch (e) {}
-if (!$("server").value) $("server").value = "127.0.0.1:7878";
+  if (!$("server").value) $("server").value = "127.0.0.1:7878";
+  $("password").focus();
+})();

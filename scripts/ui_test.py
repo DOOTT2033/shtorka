@@ -39,12 +39,14 @@ with sync_playwright() as p:
     page.click("#login-theme")  # auto -> dark
     check(page.evaluate("document.documentElement.dataset.theme") == "dark", "цикл тем возвращается к тёмной")
 
-    # Вход.
+    # Регистрация (первый вход на чистом сервере).
     page.fill("#server", "127.0.0.1:7878")
     page.fill("#name", "Вася")
+    page.fill("#password", "1234")
+    page.click("#mode-toggle")  # вход -> регистрация
     page.click("#connect")
     expect(page.locator("#status")).to_have_text("в сети", timeout=8000)
-    check(page.is_visible("#app"), "вход в приложение")
+    check(page.is_visible("#app"), "регистрация и вход в приложение")
 
     # Текст.
     page.fill("#input", "привет, это тест")
@@ -101,7 +103,17 @@ with sync_playwright() as p:
     time.sleep(0.6)
     page.screenshot(path=f"{SHOTS}/chat-dark.png", full_page=False)
 
-    # Ошибка: занятое имя (второе окно с тем же именем, пока первое в сети).
+    # Настройки: смена пароля.
+    page.click("#settings-btn")
+    check(page.is_visible("#settings"), "модалка настроек открылась")
+    page.fill("#pw-old", "1234")
+    page.fill("#pw-new", "5678")
+    page.click("#pw-save")
+    expect(page.locator("#pw-msg")).to_have_text("Пароль изменён", timeout=5000)
+    check(True, "смена пароля через настройки")
+    page.click("#settings-close")
+
+    # Второй вход под тем же аккаунтом вытесняет первую сессию.
     ctx2 = browser.new_context(viewport={"width": 900, "height": 600})
     p2 = ctx2.new_page()
     p2.goto(CLIENT)
@@ -109,9 +121,13 @@ with sync_playwright() as p:
     p2.reload()
     p2.fill("#server", "127.0.0.1:7878")
     p2.fill("#name", "Вася")
+    p2.fill("#password", "5678")
     p2.click("#connect")
     time.sleep(2)
-    check("занято" in p2.locator("#login-error").inner_text() and p2.is_visible("#login"), "вторая вкладка с тем же именем получает «Имя уже занято» на входе")
+    check(p2.is_visible("#app"), "вторая вкладка вошла под тем же аккаунтом (с новым паролем)")
+    time.sleep(1)
+    check(page.is_visible("#login") and "другого устройства" in page.locator("#login-error").inner_text(),
+          "первая вкладка вытеснена с сообщением о другом устройстве")
     ctx2.close()
 
     browser.close()

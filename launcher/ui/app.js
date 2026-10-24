@@ -96,6 +96,7 @@ async function refresh() {
     renderAddresses(s.addresses, s.port);
     renderUsers(s.users);
     $("msgs").textContent = s.messages;
+    $("accs").textContent = s.accounts == null ? "—" : s.accounts;
     renderLogs(s.logs);
   } catch (e) {
     console.error(e);

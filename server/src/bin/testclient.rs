@@ -1,7 +1,7 @@
-//! Консольный тестовый клиент. Каждая строка уходит в чат.
+//! Консольный тестовый клиент: регистрация/вход, затем каждая строка уходит в чат.
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
-use shared::{ClientMsg, ServerMsg};
+use shared::{AuthReq, AuthResp, ClientMsg, ServerMsg};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -9,17 +9,46 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 struct Args {
     #[arg(long, default_value = "Тест")]
     name: String,
-    #[arg(long, default_value = "ws://127.0.0.1:7878")]
+    #[arg(long, default_value = "1234")]
+    password: String,
+    #[arg(long, default_value = "http://127.0.0.1:7878")]
     url: String,
+    /// Если аккаунта нет — зарегистрировать, а не только входить.
+    #[arg(long)]
+    register: bool,
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    let url = format!("{}/ws?name={}", args.url.trim_end_matches('/'), urlencode(&args.name));
+    let base = args.url.trim_end_matches('/').replace("ws://", "http://").replace("wss://", "https://");
+
+    // Вход; при неудаче — регистрация (или сразу регистрация по флагу).
+    let mut resp = post_auth(&base, "login", &args.name, &args.password).await;
+    if resp.is_none() && !args.register {
+        println!("Вход не удался, пробую зарегистрироваться…");
+        resp = post_auth(&base, "register", &args.name, &args.password).await;
+    }
+    if args.register && resp.is_none() {
+        resp = post_auth(&base, "register", &args.name, &args.password).await;
+    }
+    let AuthResp { token, name } = match resp {
+        Some(r) => r,
+        None => {
+            eprintln!("Не удалось войти или зарегистрироваться");
+            std::process::exit(1);
+        }
+    };
+
+    let ws_base = args
+        .url
+        .trim_end_matches('/')
+        .replace("http://", "ws://")
+        .replace("https://", "wss://");
+    let url = format!("{ws_base}/ws?name={}&token={}", urlencode(&name), urlencode(&token));
     let (ws, _) = connect_async(&url).await.expect("Не удалось подключиться");
     let (mut sink, mut stream) = ws.split();
-    println!("Подключено как {}", args.name);
+    println!("Подключено как {name}");
 
     let reader = tokio::spawn(async move {
         while let Some(Ok(Message::Text(raw))) = stream.next().await {
@@ -30,6 +59,7 @@ async fn main() {
                 }
                 Ok(ServerMsg::System { text }) => println!("* {text}"),
                 Ok(ServerMsg::Error { text }) => println!("! ошибка: {text}"),
+                Ok(ServerMsg::Kick { text }) => println!("! сессия закрыта: {text}"),
                 Ok(ServerMsg::Welcome { user }) => println!("Добро пожаловать, {user}"),
                 Err(e) => println!("? не разобрал: {e} ({raw})"),
             }
@@ -48,6 +78,12 @@ async fn main() {
         }
     }
     reader.abort();
+}
+
+async fn post_auth(base: &str, path: &str, name: &str, password: &str) -> Option<AuthResp> {
+    let body = serde_json::to_string(&AuthReq { name: name.into(), password: password.into() }).unwrap();
+    let req = ureq::post(&format!("{base}/{path}")).set("content-type", "application/json");
+    req.send_bytes(body.as_bytes()).ok()?.into_json::<AuthResp>().ok()
 }
 
 fn urlencode(s: &str) -> String {

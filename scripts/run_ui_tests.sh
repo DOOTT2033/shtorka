@@ -3,7 +3,9 @@
 set -e
 cd "$(dirname "$0")/.."
 DATA=$(mktemp -d)
-./target/debug/server --port 7878 --data "$DATA" > /tmp/ui_server.log 2>&1 &
+BIN=${CARGO_TARGET_DIR:-target}/debug
+cargo build -q -p server
+"$BIN/server" --port 7878 --data "$DATA" > /tmp/ui_server.log 2>&1 &
 SRV=$!
 (cd client/ui && python3 -m http.server 8000 --bind 127.0.0.1 > /tmp/ui_static.log 2>&1) &
 STATIC=$!

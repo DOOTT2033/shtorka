@@ -22,6 +22,8 @@ struct Status {
     port: u16,
     users: Vec<String>,
     messages: usize,
+    /// Аккаунтов в базе (None — сервер остановлен).
+    accounts: Option<usize>,
     logs: Vec<String>,
     addresses: Vec<Address>,
 }
@@ -76,15 +78,16 @@ async fn status(state: tauri::State<'_, Running>, port: Option<u16>) -> Result<S
         Some(h) => h.addr.port(),
         None => port.unwrap_or(7878),
     };
-    let (running, users, messages, logs) = match guard.as_ref() {
-        Some(h) => (true, h.users(), h.message_count(), h.logs()),
-        None => (false, Vec::new(), 0, Vec::new()),
+    let (running, users, messages, accounts, logs) = match guard.as_ref() {
+        Some(h) => (true, h.users(), h.message_count(), Some(h.account_count()), h.logs()),
+        None => (false, Vec::new(), 0, None, Vec::new()),
     };
     Ok(Status {
         running,
         port: port_now,
         users,
         messages,
+        accounts,
         logs,
         addresses: list_addresses(port_now),
     })
@@ -99,11 +102,16 @@ async fn start_server(state: tauri::State<'_, Running>, port: u16) -> Result<(),
     if port < 1024 {
         return Err("Порт должен быть от 1024 до 65535".into());
     }
-    let data_dir = std::env::current_exe()
+    let exe_dir = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("data")))
-        .unwrap_or_else(|| std::path::PathBuf::from("data"));
-    let handle = server::start("0.0.0.0", port, data_dir).await?;
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // Конфиг рядом с exe; порт из окна лаунчера перекрывает config.toml.
+    let mut cfg = server::Config::load_or_create(&exe_dir.join("config.toml")).unwrap_or_default();
+    cfg.host = "0.0.0.0".into();
+    cfg.port = port;
+    cfg.data_dir = exe_dir.join("data").to_string_lossy().to_string();
+    let handle = server::start(cfg).await?;
     *guard = Some(handle);
     Ok(())
 }
