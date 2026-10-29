@@ -1,10 +1,40 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::Serialize;
+use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
 
 /// Запущенный сервер (если есть).
 struct Running(Mutex<Option<server::ServerHandle>>);
+
+/// Проверяет, что в папку можно писать (при необходимости создаёт её).
+fn writable_dir(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(".shtorka-write-test");
+    let ok = std::fs::write(&probe, b"ok").is_ok();
+    if ok {
+        let _ = std::fs::remove_file(&probe);
+    }
+    ok
+}
+
+/// Где хранить config.toml и data.
+///
+/// Портативная сборка: рядом с exe. Если exe лежит в Program Files (установщик),
+/// туда писать нельзя — тогда `%LOCALAPPDATA%\Shtorka\server`.
+fn storage_dirs(exe_dir: &Path) -> (PathBuf, PathBuf) {
+    if writable_dir(exe_dir) {
+        return (exe_dir.to_path_buf(), exe_dir.join("data"));
+    }
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Shtorka")
+        .join("server");
+    (base.clone(), base.join("data"))
+}
 
 #[derive(Serialize)]
 struct Address {
@@ -106,11 +136,14 @@ async fn start_server(state: tauri::State<'_, Running>, port: u16) -> Result<(),
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    // Конфиг рядом с exe; порт из окна лаунчера перекрывает config.toml.
-    let mut cfg = server::Config::load_or_create(&exe_dir.join("config.toml")).unwrap_or_default();
+    // Портативно — рядом с exe; после установки в Program Files — в %LOCALAPPDATA%.
+    let (cfg_dir, data_dir) = storage_dirs(&exe_dir);
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("Не удалось создать папку данных {}: {e}", data_dir.display()))?;
+    let mut cfg = server::Config::load_or_create(&cfg_dir.join("config.toml")).unwrap_or_default();
     cfg.host = "0.0.0.0".into();
     cfg.port = port;
-    cfg.data_dir = exe_dir.join("data").to_string_lossy().to_string();
+    cfg.data_dir = data_dir.to_string_lossy().to_string();
     let handle = server::start(cfg).await?;
     *guard = Some(handle);
     Ok(())
@@ -149,4 +182,60 @@ fn main() {
         .invoke_handler(tauri::generate_handler![status, start_server, stop_server, public_ip])
         .run(tauri::generate_context!())
         .expect("ошибка запуска лаунчера");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "shtorka-launcher-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn writable_dir_detects_writable_folder() {
+        let dir = temp_dir("writable");
+        assert!(writable_dir(&dir));
+        // Пробный файл не должен оставаться.
+        assert!(!dir.join(".shtorka-write-test").exists());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn writable_dir_rejects_path_under_file() {
+        let dir = temp_dir("blocked");
+        let file = dir.join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(!writable_dir(&file.join("data")));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn portable_mode_keeps_data_next_to_exe() {
+        let dir = temp_dir("portable");
+        let (cfg_dir, data_dir) = storage_dirs(&dir);
+        assert_eq!(cfg_dir, dir);
+        assert_eq!(data_dir, dir.join("data"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn installed_mode_falls_back_to_local_appdata() {
+        let dir = temp_dir("installed");
+        let file = dir.join("exe-dir-is-a-file");
+        std::fs::write(&file, b"x").unwrap();
+        let (cfg_dir, data_dir) = storage_dirs(&file);
+        let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap();
+        assert_eq!(cfg_dir, base.join("Shtorka").join("server"));
+        assert_eq!(data_dir, base.join("Shtorka").join("server").join("data"));
+        std::fs::remove_dir_all(dir).ok();
+    }
 }

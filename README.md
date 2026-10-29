@@ -76,6 +76,20 @@ cargo run -p server --bin testclient -- --name Вася --password 1234 --url ht
 
 Автотест: `bash scripts/smoke.sh` (нужен запущенный сервер на :7878).
 
+## Сборка для Windows
+
+```
+powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
+```
+
+Скрипт прогоняет тесты (`server`, `launcher`), собирает `server.exe`, `messenger.exe`,
+`messenger-server.exe`, MSI/NSIS-установщики и складывает всё в `dist/`
+(портативный zip + `SHA256SUMS.txt`).
+
+- Портативная сборка хранит `config.toml` и `data` рядом с exe.
+- После установки в `Program Files` данные пишутся в `%LOCALAPPDATA%\Shtorka\server`
+  (обычному пользователю туда не нужны права администратора).
+
 ## План
 
 - **0.1.0 — GUI UPDATE:** настройка цветов, фонов и оформления интерфейса.
