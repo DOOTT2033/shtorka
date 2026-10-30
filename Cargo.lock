@@ -528,7 +528,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "client"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "tauri",
  "tauri-build",
@@ -1941,7 +1941,7 @@ dependencies = [
 
 [[package]]
 name = "launcher"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "if-addrs",
  "serde",
@@ -3223,7 +3223,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "argon2",
  "axum",
@@ -3275,7 +3275,7 @@ dependencies = [
 
 [[package]]
 name = "shared"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",

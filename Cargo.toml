@@ -1,3 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["shared", "server", "launcher", "client"]
+
+# Релизные exe: меньше размер и быстрее работа (ценой времени сборки).
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

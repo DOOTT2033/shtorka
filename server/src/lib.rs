@@ -1,12 +1,11 @@
-//! Ядро сервера Шторки 0.0.2. Используется и консольным бинарником, и лаунчером.
+﻿//! Ядро сервера Шторки 0.1.0. Используется и консольным бинарником, и лаунчером.
 //!
-//! Новое в 0.0.2:
-//! - аккаунты (регистрация/вход по паролю, argon2, токены сессий);
-//! - история сообщений и аккаунты хранятся в SQLite (`data/server.db`);
-//! - файлы по-прежнему в `data/files`;
-//! - конфиг `config.toml` (порт, лимиты, папка данных);
-//! - ошибки уходят персонально отправителю, а не в общий чат;
-//! - повторный вход под тем же аккаунтом вытесняет старую сессию.
+//! 0.1.0:
+//! - юзернейм (латиница, уникальный) и отдельное отображаемое имя;
+//! - аватарки;
+//! - личные сообщения и поиск пользователей по юзернейму;
+//! - настройки приватности (кто может писать в личку, показывать ли онлайн);
+//! - файлы и аватарки отдаются только авторизованным клиентам.
 
 pub mod db;
 
@@ -35,7 +34,10 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use rand::RngCore;
 use serde::Deserialize;
-use shared::{kind_for_mime, AccountInfo, Attachment, AuthReq, AuthResp, ClientMsg, PasswordReq, ServerMsg, StoredMessage};
+use shared::{
+    kind_for_mime, normalize_username, AccountInfo, Attachment, AuthReq, AuthResp, ClientMsg,
+    PasswordReq, ProfileReq, ServerMsg, StoredMessage, UserCard, MAX_TEXT_LEN,
+};
 use tokio::{
     sync::{broadcast, mpsc, oneshot},
     task::JoinHandle,
@@ -43,10 +45,10 @@ use tokio::{
 use tower_http::cors::CorsLayer;
 
 pub const HISTORY_LIMIT: usize = 500;
-pub const MAX_TEXT_LEN: usize = 4000;
-pub const MAX_NAME_LEN: usize = 32;
 /// Максимальный размер одного файла по умолчанию (50 МБ).
 pub const MAX_UPLOAD: usize = 50 * 1024 * 1024;
+/// Максимальный размер аватарки (5 МБ).
+pub const MAX_AVATAR: usize = 5 * 1024 * 1024;
 
 /* ---------- Конфиг ---------- */
 
@@ -114,9 +116,9 @@ pub struct AppState {
     store: db::Store,
     tx: broadcast::Sender<ServerMsg>,
     close_tx: broadcast::Sender<()>,
-    /// Токен сессии → имя пользователя.
+    /// Токен сессии → юзернейм.
     sessions: Mutex<HashMap<String, String>>,
-    /// Кто онлайн: имя → id сессии подключения.
+    /// Кто онлайн: юзернейм → id сессии подключения.
     online: Mutex<HashMap<String, u64>>,
     /// Персональные каналы: id сессии → отправитель.
     personal: Mutex<HashMap<u64, mpsc::UnboundedSender<ServerMsg>>>,
@@ -182,6 +184,47 @@ impl AppState {
     fn personal_send(&self, session_id: u64, msg: ServerMsg) {
         if let Some(tx) = self.personal.lock().unwrap().get(&session_id) {
             let _ = tx.send(msg);
+        }
+    }
+
+    fn is_online(&self, name: &str) -> bool {
+        self.online.lock().unwrap().contains_key(name)
+    }
+
+    fn card(&self, user: &db::User, viewer: &str) -> UserCard {
+        let online = self.is_online(&user.name) && (user.show_online || user.name == viewer);
+        UserCard {
+            username: user.name.clone(),
+            display_name: if user.display_name.is_empty() {
+                user.name.clone()
+            } else {
+                user.display_name.clone()
+            },
+            avatar: user.avatar.clone(),
+            online,
+        }
+    }
+
+    fn account_info(&self, user: &db::User) -> AccountInfo {
+        AccountInfo {
+            username: user.name.clone(),
+            display_name: user.display_name.clone(),
+            avatar: user.avatar.clone(),
+            created: user.created,
+            dm_privacy: user.dm_privacy.clone(),
+            show_online: user.show_online,
+        }
+    }
+
+    fn auth_resp(&self, user: &db::User, token: String) -> AuthResp {
+        AuthResp {
+            token,
+            username: user.name.clone(),
+            display_name: user.display_name.clone(),
+            avatar: user.avatar.clone(),
+            created: user.created,
+            dm_privacy: user.dm_privacy.clone(),
+            show_online: user.show_online,
         }
     }
 }
@@ -258,11 +301,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health_handler))
         .route("/upload", post(upload_handler))
         .route("/files/:id", get(file_handler))
+        .route("/avatar", post(avatar_handler).delete(avatar_delete_handler))
         .route("/register", post(register_handler))
         .route("/login", post(login_handler))
+        .route("/logout", post(logout_handler))
         .route("/password", post(password_handler))
+        .route("/profile", post(profile_handler))
         .route("/account", get(account_handler))
-        .layer(DefaultBodyLimit::max(state.max_upload))
+        .route("/users", get(users_handler))
+        .layer(DefaultBodyLimit::max(state.max_upload.max(MAX_AVATAR)))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -278,11 +325,6 @@ pub fn now_ts() -> u64 {
 fn fmt_time(ts: u64) -> String {
     let local = ts + 5 * 3600;
     format!("{:02}:{:02}:{:02}", (local / 3600) % 24, (local / 60) % 60, local % 60)
-}
-
-pub fn valid_name(name: &str) -> bool {
-    let n = name.trim();
-    !n.is_empty() && n.chars().count() <= MAX_NAME_LEN && !n.chars().any(|c| c.is_control())
 }
 
 /// Безопасное имя файла: без путей и управляющих символов, до 200 символов.
@@ -316,13 +358,31 @@ fn send_json(msg: &ServerMsg) -> Message {
     Message::Text(serde_json::to_string(msg).unwrap())
 }
 
+fn new_file_id(state: &AppState) -> String {
+    format!(
+        "{:x}-{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+        state.next_id.fetch_add(1, Ordering::SeqCst)
+    )
+}
+
 /* ---------- Аккаунты ---------- */
 
 fn auth_error(e: db::AuthError) -> Response {
     let (code, text) = match e {
-        db::AuthError::BadName => (StatusCode::BAD_REQUEST, "Некорректное имя"),
-        db::AuthError::BadPassword => (StatusCode::BAD_REQUEST, "Пароль должен быть от 4 до 128 символов"),
-        db::AuthError::NameTaken => (StatusCode::CONFLICT, "Имя уже занято"),
+        db::AuthError::BadName => (
+            StatusCode::BAD_REQUEST,
+            "Юзернейм: 3–20 символов, только латиница (a–z), цифры и _, без _ по краям",
+        ),
+        db::AuthError::BadPassword => (
+            StatusCode::BAD_REQUEST,
+            "Пароль: 6–128 символов, латиница, цифры и знаки без пробелов",
+        ),
+        db::AuthError::BadPrivacy => (StatusCode::BAD_REQUEST, "Некорректная настройка приватности"),
+        db::AuthError::NameTaken => (StatusCode::CONFLICT, "Этот юзернейм уже занят"),
         db::AuthError::WrongCredentials => (StatusCode::UNAUTHORIZED, "Неверный пароль"),
         db::AuthError::NoUser => (StatusCode::NOT_FOUND, "Аккаунт не найден"),
     };
@@ -330,22 +390,39 @@ fn auth_error(e: db::AuthError) -> Response {
 }
 
 async fn register_handler(State(state): State<Arc<AppState>>, Json(req): Json<AuthReq>) -> Response {
-    let name = req.name.trim().to_string();
-    match state.store.register(&name, &req.password, now_ts()) {
-        Ok(()) => {
-            state.log(format!("Зарегистрирован аккаунт {name}"));
-            Json(AuthResp { token: state.new_token(&name), name }).into_response()
+    let username = normalize_username(&req.username);
+    match state.store.register(&username, &req.display_name, &req.password, now_ts()) {
+        Ok(user) => {
+            state.log(format!("Зарегистрирован аккаунт @{}", user.name));
+            let token = state.new_token(&user.name);
+            Json(state.auth_resp(&user, token)).into_response()
         }
         Err(e) => auth_error(e),
     }
 }
 
 async fn login_handler(State(state): State<Arc<AppState>>, Json(req): Json<AuthReq>) -> Response {
-    let name = req.name.trim().to_string();
-    match state.store.login(&name, &req.password) {
-        Ok(_) => Json(AuthResp { token: state.new_token(&name), name }).into_response(),
+    let username = normalize_username(&req.username);
+    match state.store.login(&username, &req.password) {
+        Ok(user) => {
+            let token = state.new_token(&user.name);
+            Json(state.auth_resp(&user, token)).into_response()
+        }
         Err(e) => auth_error(e),
     }
+}
+
+#[derive(Deserialize)]
+struct LogoutReq {
+    token: String,
+}
+
+async fn logout_handler(State(state): State<Arc<AppState>>, Json(req): Json<LogoutReq>) -> Response {
+    let removed = state.sessions.lock().unwrap().remove(&req.token);
+    if let Some(name) = removed {
+        state.log(format!("@{name} вышел из аккаунта"));
+    }
+    "ok".into_response()
 }
 
 async fn password_handler(State(state): State<Arc<AppState>>, Json(req): Json<PasswordReq>) -> Response {
@@ -354,8 +431,26 @@ async fn password_handler(State(state): State<Arc<AppState>>, Json(req): Json<Pa
     };
     match state.store.change_password(&name, &req.old, &req.new) {
         Ok(()) => {
-            state.log(format!("{name} сменил пароль"));
+            state.log(format!("@{name} сменил пароль"));
             "ok".into_response()
+        }
+        Err(e) => auth_error(e),
+    }
+}
+
+async fn profile_handler(State(state): State<Arc<AppState>>, Json(req): Json<ProfileReq>) -> Response {
+    let Some(name) = state.session_user(&req.token) else {
+        return (StatusCode::UNAUTHORIZED, "Не авторизован").into_response();
+    };
+    match state.store.update_profile(
+        &name,
+        req.display_name.as_deref(),
+        req.dm_privacy.as_deref(),
+        req.show_online,
+    ) {
+        Ok(user) => {
+            state.log(format!("@{name} обновил профиль"));
+            Json(state.account_info(&user)).into_response()
         }
         Err(e) => auth_error(e),
     }
@@ -363,6 +458,7 @@ async fn password_handler(State(state): State<Arc<AppState>>, Json(req): Json<Pa
 
 #[derive(Deserialize)]
 struct TokenQuery {
+    #[serde(default)]
     token: String,
 }
 
@@ -371,16 +467,44 @@ async fn account_handler(State(state): State<Arc<AppState>>, Query(q): Query<Tok
         return StatusCode::UNAUTHORIZED.into_response();
     };
     match state.store.account_info(&name) {
-        Some(u) => Json(AccountInfo { name: u.name, created: u.created }).into_response(),
+        Some(u) => Json(state.account_info(&u)).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct UsersQuery {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    q: String,
+}
+
+async fn users_handler(State(state): State<Arc<AppState>>, Query(q): Query<UsersQuery>) -> Response {
+    let Some(me) = state.session_user(&q.token) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let mut users: Vec<UserCard> = state
+        .store
+        .search_users(&q.q, &me, 50)
+        .iter()
+        .map(|u| state.card(u, &me))
+        .collect();
+    // Сначала те, кто в сети, затем по алфавиту.
+    users.sort_by(|a, b| {
+        b.online
+            .cmp(&a.online)
+            .then_with(|| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()))
+    });
+    Json(users).into_response()
 }
 
 /* ---------- WebSocket-чат ---------- */
 
 #[derive(Deserialize)]
 struct WsParams {
-    name: String,
+    username: String,
+    #[serde(default)]
     token: String,
 }
 
@@ -389,11 +513,11 @@ async fn ws_handler(
     Query(params): Query<WsParams>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, params.name, params.token, state))
+    ws.on_upgrade(move |socket| handle_socket(socket, params.username, params.token, state))
 }
 
-async fn handle_socket(socket: WebSocket, name: String, token: String, state: Arc<AppState>) {
-    let name = name.trim().to_string();
+async fn handle_socket(socket: WebSocket, username: String, token: String, state: Arc<AppState>) {
+    let name = normalize_username(&username);
     let (mut sink, mut stream) = socket.split();
 
     // Проверяем токен: имя в сокете должно совпадать с именем токена.
@@ -406,10 +530,14 @@ async fn handle_socket(socket: WebSocket, name: String, token: String, state: Ar
             return;
         }
     }
-    if !valid_name(&name) {
-        let _ = sink.send(send_json(&ServerMsg::Error { text: "Некорректное имя".into() })).await;
+    // Аккаунты из старых версий могли быть с кириллицей — им вход не блокируем,
+    // достаточно существования аккаунта и верного токена.
+    let Some(profile) = state.store.user(&name) else {
+        let _ = sink
+            .send(send_json(&ServerMsg::Error { text: "Аккаунт не найден".into() }))
+            .await;
         return;
-    }
+    };
 
     let session_id = state.next_session.fetch_add(1, Ordering::SeqCst);
     let (personal_tx, mut personal_rx) = mpsc::unbounded_channel::<ServerMsg>();
@@ -422,14 +550,21 @@ async fn handle_socket(socket: WebSocket, name: String, token: String, state: Ar
     if let Some(old_id) = replaced {
         state.personal_send(old_id, ServerMsg::Kick { text: "Выполнен вход с другого устройства".into() });
         state.personal.lock().unwrap().remove(&old_id);
-        state.log(format!("{name} переподключился, старая сессия закрыта"));
+        state.log(format!("@{name} переподключился, старая сессия закрыта"));
     } else {
-        state.log(format!("{name} подключился"));
-        let _ = state.tx.send(ServerMsg::System { text: format!("{name} вошёл в чат") });
+        state.log(format!("@{name} подключился"));
+        let _ = state.tx.send(ServerMsg::System {
+            text: format!("{} вошёл в чат", profile.display_name),
+        });
     }
     state.personal.lock().unwrap().insert(session_id, personal_tx);
 
-    let _ = sink.send(send_json(&ServerMsg::Welcome { user: name.clone() })).await;
+    let _ = sink
+        .send(send_json(&ServerMsg::Welcome {
+            username: name.clone(),
+            display_name: profile.display_name.clone(),
+        }))
+        .await;
 
     let mut rx = state.tx.subscribe();
     let mut send_task = tokio::spawn(async move {
@@ -462,10 +597,10 @@ async fn handle_socket(socket: WebSocket, name: String, token: String, state: Ar
         while let Some(Ok(msg)) = stream.next().await {
             match msg {
                 Message::Text(raw) => match serde_json::from_str::<ClientMsg>(&raw) {
-                    Ok(ClientMsg::Text { text, attachment_id }) => {
-                        handle_text(&recv_state, session_id, &recv_name, text, attachment_id).await;
+                    Ok(ClientMsg::Text { text, attachment_id, to }) => {
+                        handle_text(&recv_state, session_id, &recv_name, text, attachment_id, to).await;
                     }
-                    Err(e) => recv_state.log(format!("Некорректный JSON от {recv_name}: {e}")),
+                    Err(e) => recv_state.log(format!("Некорректный JSON от @{recv_name}: {e}")),
                 },
                 Message::Close(_) => break,
                 _ => {}
@@ -495,8 +630,10 @@ async fn handle_socket(socket: WebSocket, name: String, token: String, state: Ar
     };
     state.personal.lock().unwrap().remove(&session_id);
     if was_current {
-        state.log(format!("{name} отключился"));
-        let _ = state.tx.send(ServerMsg::System { text: format!("{name} вышел из чата") });
+        state.log(format!("@{name} отключился"));
+        let _ = state.tx.send(ServerMsg::System {
+            text: format!("{} вышел из чата", profile.display_name),
+        });
     }
 }
 
@@ -506,6 +643,7 @@ async fn handle_text(
     from: &str,
     text: String,
     attachment_id: Option<String>,
+    to: Option<String>,
 ) {
     let err = |text: &str| {
         state.personal_send(session_id, ServerMsg::Error { text: text.to_string() });
@@ -514,6 +652,25 @@ async fn handle_text(
     if text.chars().count() > MAX_TEXT_LEN {
         err(&format!("Сообщение длиннее {MAX_TEXT_LEN} символов"));
         return;
+    }
+
+    let to = to.map(|t| normalize_username(&t)).filter(|t| !t.is_empty());
+    if let Some(peer) = &to {
+        if peer == from {
+            err("Нельзя отправить сообщение самому себе");
+            return;
+        }
+        match state.store.user(peer) {
+            None => {
+                err("Пользователь не найден");
+                return;
+            }
+            Some(u) if u.dm_privacy == "nobody" => {
+                err("Пользователь запретил личные сообщения");
+                return;
+            }
+            Some(_) => {}
+        }
     }
 
     // Вложение берём с диска, а не из клиентских данных — подделать метаданные нельзя.
@@ -531,11 +688,18 @@ async fn handle_text(
         return;
     }
 
+    let Some(sender) = state.store.user(from) else {
+        err("Аккаунт не найден");
+        return;
+    };
     let id = state.next_id.fetch_add(1, Ordering::SeqCst);
     let ts = now_ts();
     let message = StoredMessage {
         id,
         from: from.to_string(),
+        from_name: sender.display_name.clone(),
+        from_avatar: sender.avatar.clone(),
+        to: to.clone(),
         text: text.clone(),
         ts,
         attachment: attachment.clone(),
@@ -550,14 +714,34 @@ async fn handle_text(
         Some(a) => format!("[{}] {}", a.kind, a.name),
         None => String::new(),
     };
-    state.log(format!("<{from}> {text} {label}").trim_end().to_string());
-    let _ = state.tx.send(ServerMsg::Text {
+    match &to {
+        Some(peer) => state.log(format!("<@{from}> → @{peer}: {text} {label}").trim_end().to_string()),
+        None => state.log(format!("<@{from}> {text} {label}").trim_end().to_string()),
+    }
+
+    let out = ServerMsg::Text {
         id,
         from: from.to_string(),
+        from_name: sender.display_name,
+        from_avatar: sender.avatar,
+        to: to.clone(),
         text,
         ts,
         attachment,
-    });
+    };
+    match to {
+        Some(peer) => {
+            // Личное сообщение видит только отправитель и получатель.
+            state.personal_send(session_id, out.clone());
+            let peer_session = state.online.lock().unwrap().get(&peer).copied();
+            if let Some(peer_id) = peer_session {
+                state.personal_send(peer_id, out);
+            }
+        }
+        None => {
+            let _ = state.tx.send(out);
+        }
+    }
 }
 
 async fn load_attachment(state: &Arc<AppState>, id: &str) -> Option<Attachment> {
@@ -569,10 +753,11 @@ async fn load_attachment(state: &Arc<AppState>, id: &str) -> Option<Attachment> 
     serde_json::from_slice::<Attachment>(&raw).ok()
 }
 
-/* ---------- Файлы ---------- */
+/* ---------- Файлы и аватарки ---------- */
 
 #[derive(Deserialize)]
 struct UploadParams {
+    #[serde(default)]
     token: String,
     name: String,
     #[serde(default)]
@@ -596,23 +781,10 @@ async fn upload_handler(
     let name = sanitize_file_name(&params.name);
     let mime = sanitize_mime(&params.mime);
     let kind = kind_for_mime(&mime).to_string();
-    let id = format!(
-        "{:x}-{:x}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-        state.next_id.fetch_add(1, Ordering::SeqCst)
-    );
+    let id = new_file_id(&state);
     let attachment = Attachment { id: id.clone(), name, mime, size: body.len() as u64, kind };
 
-    let dir = state.files_dir();
-    let meta = serde_json::to_vec(&attachment).unwrap();
-    let write = async {
-        tokio::fs::write(dir.join(format!("{id}.bin")), &body).await?;
-        tokio::fs::write(dir.join(format!("{id}.json")), &meta).await
-    };
-    if let Err(e) = write.await {
+    if let Err(e) = save_attachment(&state, &attachment, &body).await {
         state.log(format!("Ошибка сохранения файла: {e}"));
         return (StatusCode::INTERNAL_SERVER_ERROR, "Не удалось сохранить файл").into_response();
     }
@@ -620,7 +792,80 @@ async fn upload_handler(
     Json(attachment).into_response()
 }
 
-async fn file_handler(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+async fn avatar_handler(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<TokenQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(me) = state.session_user(&q.token) else {
+        return (StatusCode::UNAUTHORIZED, "Не авторизован").into_response();
+    };
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Пустой файл").into_response();
+    }
+    if body.len() > MAX_AVATAR {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "Аватарка больше 5 МБ").into_response();
+    }
+    let raw_mime = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let mime = sanitize_mime(raw_mime);
+    if !matches!(mime.as_str(), "image/png" | "image/jpeg" | "image/webp" | "image/gif") {
+        return (StatusCode::BAD_REQUEST, "Поддерживаются PNG, JPEG, WebP и GIF").into_response();
+    }
+    let id = new_file_id(&state);
+    let attachment = Attachment {
+        id: id.clone(),
+        name: "avatar".into(),
+        mime,
+        size: body.len() as u64,
+        kind: "image".into(),
+    };
+    if let Err(e) = save_attachment(&state, &attachment, &body).await {
+        state.log(format!("Ошибка сохранения аватарки: {e}"));
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Не удалось сохранить аватарку").into_response();
+    }
+    if let Err(e) = state.store.set_avatar(&me, Some(&id)) {
+        return auth_error(e);
+    }
+    state.log(format!("@{me} обновил аватарку"));
+    match state.store.account_info(&me) {
+        Some(u) => Json(state.account_info(&u)).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn avatar_delete_handler(State(state): State<Arc<AppState>>, Query(q): Query<TokenQuery>) -> Response {
+    let Some(me) = state.session_user(&q.token) else {
+        return (StatusCode::UNAUTHORIZED, "Не авторизован").into_response();
+    };
+    if let Err(e) = state.store.set_avatar(&me, None) {
+        return auth_error(e);
+    }
+    state.log(format!("@{me} удалил аватарку"));
+    match state.store.account_info(&me) {
+        Some(u) => Json(state.account_info(&u)).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn save_attachment(state: &AppState, attachment: &Attachment, body: &[u8]) -> std::io::Result<()> {
+    let dir = state.files_dir();
+    let meta = serde_json::to_vec(attachment).unwrap();
+    tokio::fs::write(dir.join(format!("{}.bin", attachment.id)), body).await?;
+    tokio::fs::write(dir.join(format!("{}.json", attachment.id)), meta).await
+}
+
+async fn file_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<TokenQuery>,
+) -> Response {
+    if state.session_user(&q.token).is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let Some(att) = load_attachment(&state, &id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -647,11 +892,32 @@ async fn file_handler(State(state): State<Arc<AppState>>, Path(id): Path<String>
 
 /* ---------- История ---------- */
 
-async fn history_handler(State(state): State<Arc<AppState>>, Query(q): Query<TokenQuery>) -> Response {
-    if state.session_user(&q.token).is_none() {
+#[derive(Deserialize)]
+struct HistoryQuery {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    peer: Option<String>,
+}
+
+async fn history_handler(State(state): State<Arc<AppState>>, Query(q): Query<HistoryQuery>) -> Response {
+    let Some(me) = state.session_user(&q.token) else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
-    Json(state.store.recent_messages(state.history_limit)).into_response()
+    };
+    let peer = q.peer.map(|p| normalize_username(&p)).filter(|p| !p.is_empty());
+    let messages = match peer {
+        Some(peer) => {
+            if peer == me {
+                return (StatusCode::BAD_REQUEST, "Нельзя открыть переписку с собой").into_response();
+            }
+            if state.store.user(&peer).is_none() {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            state.store.recent_dm(&me, &peer, state.history_limit)
+        }
+        None => state.store.recent_general(state.history_limit),
+    };
+    Json(messages).into_response()
 }
 
 async fn health_handler() -> &'static str {

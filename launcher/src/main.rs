@@ -176,12 +176,46 @@ async fn public_ip() -> Result<String, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// Показывает ошибку запуска в окне (если интерфейс не смог стартовать).
+#[cfg(windows)]
+fn startup_error(text: &str) {
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(hwnd: *mut core::ffi::c_void, text: *const u16, caption: *const u16, utype: u32) -> i32;
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
+        std::ffi::OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    let body = wide(text);
+    let title = wide("Шторка — сервер");
+    unsafe {
+        MessageBoxW(std::ptr::null_mut(), body.as_ptr(), title.as_ptr(), 0x10);
+    }
+}
+
+#[cfg(not(windows))]
+fn startup_error(text: &str) {
+    eprintln!("{text}");
+}
+
 fn main() {
-    tauri::Builder::default()
+    let result = tauri::Builder::default()
         .manage(Running(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![status, start_server, stop_server, public_ip])
-        .run(tauri::generate_context!())
-        .expect("ошибка запуска лаунчера");
+        .run(tauri::generate_context!());
+    if let Err(e) = result {
+        startup_error(&format!(
+            "Не удалось запустить интерфейс лаунчера Шторки.\n\n{e}\n\n\
+             Чаще всего это значит, что на компьютере нет компонента \
+             Microsoft Edge WebView2 Runtime. Его можно бесплатно установить:\n\
+             https://go.microsoft.com/fwlink/p/?LinkId=2124703\n\n\
+             Либо запустите консольный server.exe — он не требует WebView2."
+        ));
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]

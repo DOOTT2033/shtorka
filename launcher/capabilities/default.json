@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Окно лаунчера",
+  "description": "Основные разрешения лаунчера Шторки",
   "windows": ["main"],
   "permissions": ["core:default"]
 }

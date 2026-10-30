@@ -1,15 +1,15 @@
-﻿# Собирает релиз 0.0.2 для Windows x64 в dist/.
-# Требования: Rust (MSVC), VS Build Tools (C++), WebView2, cargo-tauri в PATH.
-# Запуск: powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
+﻿# Builds the 0.1.0 Windows x64 release into dist/ (portable exe files only).
+# Requirements: Rust (MSVC), VS Build Tools (C++), WebView2, cargo-tauri in PATH.
+# Run: powershell -ExecutionPolicy Bypass -File scripts\build_release.ps1
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-# rustup ставит cargo в %USERPROFILE%\.cargo\bin, но у уже запущенных процессов PATH старый.
+# rustup installs cargo into %USERPROFILE%\.cargo\bin; already running shells keep an old PATH.
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 
-$version = '0.0.2'
+$version = '0.1.0'
 $name = "Shtorka-$version-win64"
 $dist = Join-Path $root 'dist'
 $portable = Join-Path $dist $name
@@ -29,50 +29,72 @@ if ($vcvars) {
         if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
     }
 } else {
-    Write-Warning 'vcvars64.bat не найден — cargo может не найти link.exe'
+    Write-Warning 'vcvars64.bat not found - cargo may not find link.exe'
 }
 
-Write-Host '==> cargo test (server)'
-cargo test --release -p server
-Write-Host '==> cargo test (launcher)'
-cargo test -p launcher
-Write-Host '==> сборка server.exe'
+Write-Host '==> cargo test (workspace)'
+cargo test --workspace
+if ($LASTEXITCODE -ne 0) { throw "cargo test failed with exit code $LASTEXITCODE" }
+
+Write-Host '==> build server.exe'
 cargo build --release -p server
+if ($LASTEXITCODE -ne 0) { throw "server build failed with exit code $LASTEXITCODE" }
 
-Write-Host '==> сборка лаунчера и клиента (Tauri)'
-Push-Location (Join-Path $root 'launcher'); cargo tauri build; Pop-Location
-Push-Location (Join-Path $root 'client');   cargo tauri build; Pop-Location
+Write-Host '==> build Shtorka client (no installers)'
+Push-Location (Join-Path $root 'client')
+try {
+    cargo tauri build --no-bundle
+    if ($LASTEXITCODE -ne 0) { throw "client build failed with exit code $LASTEXITCODE" }
+} finally { Pop-Location }
 
-Write-Host '==> упаковка dist'
-if (Test-Path $portable) { Remove-Item $portable -Recurse -Force }
-New-Item -ItemType Directory -Path (Join-Path $portable 'installers') -Force | Out-Null
+Write-Host '==> build Shtorka Server launcher (no installers)'
+Push-Location (Join-Path $root 'launcher')
+try {
+    cargo tauri build --no-bundle
+    if ($LASTEXITCODE -ne 0) { throw "launcher build failed with exit code $LASTEXITCODE" }
+} finally { Pop-Location }
+
+Write-Host '==> check runtime dependencies'
+$exes = @(
+    (Join-Path $target 'server.exe'),
+    (Join-Path $target 'messenger.exe'),
+    (Join-Path $target 'messenger-server.exe')
+)
+foreach ($exe in $exes) {
+    if (-not (Test-Path $exe)) { throw "Missing build output: $exe" }
+    $deps = & dumpbin /nologo /dependents $exe 2>&1 | Out-String
+    if ($deps -match 'vcruntime|msvcp|api-ms-win-crt') {
+        Write-Host $deps
+        throw "Dynamic CRT dependency found in $exe"
+    }
+    Write-Host "    OK: $(Split-Path -Leaf $exe) has no VC++ runtime dependency"
+}
+
+Write-Host '==> package dist'
+if (Test-Path $dist) { Remove-Item $dist -Recurse -Force }
+New-Item -ItemType Directory -Path $portable -Force | Out-Null
+
 Copy-Item (Join-Path $target 'server.exe') $portable
 Copy-Item (Join-Path $target 'messenger.exe') (Join-Path $portable 'Shtorka.exe')
 Copy-Item (Join-Path $target 'messenger-server.exe') (Join-Path $portable 'Shtorka-Server.exe')
-# Отдельные exe для страницы релиза (как в 0.0.1-alpha).
+
+# Standalone files for the GitHub release page.
+Copy-Item (Join-Path $target 'server.exe') (Join-Path $dist 'server.exe')
 Copy-Item (Join-Path $target 'messenger.exe') (Join-Path $dist 'Shtorka.exe')
 Copy-Item (Join-Path $target 'messenger-server.exe') (Join-Path $dist 'Shtorka-Server.exe')
 
-$bundles = @(
-    @{ src = 'bundle\nsis\Shtorka_0.0.2_x64-setup.exe';             dst = 'Shtorka_0.0.2_x64-setup.exe' },
-    @{ src = 'bundle\msi\Shtorka_0.0.2_x64_en-US.msi';              dst = 'Shtorka_0.0.2_x64_en-US.msi' },
-    @{ src = 'bundle\nsis\Shtorka Server_0.0.2_x64-setup.exe';      dst = 'Shtorka-Server_0.0.2_x64-setup.exe' },
-    @{ src = 'bundle\msi\Shtorka Server_0.0.2_x64_en-US.msi';       dst = 'Shtorka-Server_0.0.2_x64_en-US.msi' }
-)
-foreach ($b in $bundles) {
-    $src = Join-Path $target $b.src
-    Copy-Item $src (Join-Path $portable ('installers\' + $b.dst)) -Force
-    Copy-Item $src (Join-Path $dist $b.dst) -Force
+$readme = Get-ChildItem (Join-Path $root 'scripts') -Filter '*.txt' | Select-Object -First 1
+if ($readme) {
+    Copy-Item $readme.FullName (Join-Path $portable $readme.Name) -Force
+    Copy-Item $readme.FullName (Join-Path $dist $readme.Name) -Force
 }
+Copy-Item (Join-Path $root "RELEASE-$version.md") (Join-Path $dist "RELEASE-$version.md") -Force
+Copy-Item (Join-Path $root "RELEASE-$version.md") (Join-Path $portable "RELEASE-$version.md") -Force
 
-Copy-Item (Join-Path $root 'RELEASE-0.0.2.md') (Join-Path $dist 'RELEASE-0.0.2.md') -Force
-Copy-Item (Join-Path $root 'scripts\ПРОЧТИ-МЕНЯ.txt') (Join-Path $portable 'ПРОЧТИ-МЕНЯ.txt') -Force
-
-# Zip с прямыми слэшами (Compress-Archive пишет обратные и ломает имена на Linux/macOS).
+# Zip with forward slashes (Compress-Archive writes backslashes and breaks names on Linux/macOS).
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 $zipPath = Join-Path $dist "$name.zip"
-Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
 $fs = [IO.File]::Open($zipPath, [IO.FileMode]::CreateNew)
 $zip = New-Object IO.Compression.ZipArchive($fs, [IO.Compression.ZipArchiveMode]::Create, $false, [Text.Encoding]::UTF8)
 foreach ($f in Get-ChildItem $portable -Recurse -File) {
@@ -85,10 +107,13 @@ foreach ($f in Get-ChildItem $portable -Recurse -File) {
 }
 $zip.Dispose(); $fs.Dispose()
 
-Get-ChildItem $dist -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | Sort-Object Name | ForEach-Object {
+$hashLines = Get-ChildItem $dist -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | Sort-Object Name | ForEach-Object {
     '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
-} | Out-File (Join-Path $dist 'SHA256SUMS.txt') -Encoding ascii
+}
+$utf8 = New-Object System.Text.UTF8Encoding $false
+[IO.File]::WriteAllText((Join-Path $dist 'SHA256SUMS.txt'), ($hashLines -join "`r`n") + "`r`n", $utf8)
 
 Write-Host ''
-Write-Host "Готово: $dist"
+Write-Host "Done: $dist"
 Get-ChildItem $dist -File | Sort-Object Name | Select-Object Name, @{n = 'MB'; e = { [math]::Round($_.Length / 1MB, 2) } }
+exit 0

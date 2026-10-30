@@ -3,7 +3,7 @@ use server::Config;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(about = "Сервер Шторки 0.0.2 (без окна)")]
+#[command(about = "Сервер Шторки 0.1.0 (без окна)")]
 struct Args {
     /// Путь к config.toml (по умолчанию — рядом с текущей папкой)
     #[arg(long, default_value = "config.toml")]
